@@ -264,19 +264,20 @@ path = "LICENSE.txt"
 checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
 
 # chrono is dual-licensed MIT OR Apache-2.0; its LICENSE.txt is a combined
-# notice carrying "Kang Seonghoon and contributors". Pick MIT from the
+# notice carrying "Kang Seonghoon and contributors". Pick Apache-2.0 from the
 # disjunction and bind the real file.
 [chrono.clarify]
-license = "MIT"
+license = "Apache-2.0"
 
 [[chrono.clarify.files]]
 path = "LICENSE.txt"
 checksum = "946c9835d8034d24404f8cfec5f4654cee5dad17e944afc3d06d742cf2882831"
 
-# siphasher is dual-licensed; its COPYING file carries the real copyright
-# lines for The Rust Project Developers and Frank Denis. Pick MIT and bind it.
+# siphasher is dual-licensed MIT OR Apache-2.0; its COPYING file carries the
+# real copyright lines for The Rust Project Developers and Frank Denis. Pick
+# Apache-2.0 and bind it.
 [siphasher.clarify]
-license = "MIT"
+license = "Apache-2.0"
 
 [[siphasher.clarify.files]]
 path = "COPYING"
@@ -286,7 +287,7 @@ checksum = "c962ee4d1d05ddc138b202b2540219ebc57893fcf97b364852094a9a94ce1365"
 # carrying "est31 <MTest31@outlook.com> and contributors". Pick MIT from the
 # disjunction and bind the real file.
 [rcgen.clarify]
-license = "MIT"
+license = "Apache-2.0"
 
 [[rcgen.clarify.files]]
 path = "LICENSE"
