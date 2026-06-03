@@ -29,10 +29,15 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
+use lore_base::error::NoRemote;
 use lore_base::types::Partition;
+use lore_revision::filter::Filter;
+use lore_revision::instance::InstanceId;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryFormat;
 use lore_revision::state::State;
+use lore_transport::ProtocolError;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Notify;
@@ -163,6 +168,36 @@ pub(crate) fn unregister(handle: LoreRevisionTree) -> Option<Arc<RevisionTreeInt
         .map(|(_, internal)| internal)
 }
 
+/// Build an [`Arc<RepositoryContext>`] backed by the immutable, mutable,
+/// and (optional) remote stores carried on `store`, targeting `repository`.
+///
+/// The synthesized context has no working-tree path — every op against the
+/// memory-based revision tree API operates only on the underlying stores.
+/// When `store` has a remote endpoint, the helper resolves the
+/// per-partition `Arc<Connection>` so the context lands in the `Connected`
+/// remote state on success; a connection failure propagates as `Failed`.
+/// Absent a remote endpoint the context resolves directly to the `Offline`
+/// terminal state.
+pub(crate) async fn synth_repository_context(
+    store: &StoreInternal,
+    repository: Partition,
+) -> Arc<RepositoryContext> {
+    let remote_result = match store.remote.as_ref() {
+        Some(endpoint) => endpoint.session_connection(repository).await,
+        None => Err(ProtocolError::from(NoRemote)),
+    };
+    Arc::new(RepositoryContext::new(
+        None,
+        store.immutable.clone(),
+        store.mutable.clone(),
+        repository,
+        InstanceId::default(),
+        remote_result,
+        Arc::new(Filter::default()),
+        RepositoryFormat::Lore,
+    ))
+}
+
 /// RAII guard protecting an in-flight op. Obtained via
 /// [`RevisionTreeGuard::enter`]; dropping it pairs the in-flight
 /// increment with the matching decrement and, when the count reaches
@@ -271,5 +306,41 @@ pub(crate) mod test_support {
             invalid: AtomicBool::new(false),
             drained: Notify::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod synth_repository_context_tests {
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::repository::RemoteStatus;
+    use lore_revision::state::State;
+
+    use super::synth_repository_context;
+    use crate::storage::store::in_memory_for_tests;
+
+    #[tokio::test]
+    async fn synth_repository_context_round_trips_empty_state_via_zero_hash_deserialize() {
+        let store = in_memory_for_tests("synth-context-test").await;
+        let partition = Partition::from([0x77u8; 16]);
+
+        let repo_context = synth_repository_context(&store, partition).await;
+
+        State::deserialize(repo_context.clone(), Hash::default())
+            .await
+            .expect("zero hash must deserialize to an empty state");
+
+        assert!(
+            repo_context.path.is_none(),
+            "synthesized context must have no working-tree path"
+        );
+        assert_eq!(
+            repo_context.id, partition,
+            "synthesized context must carry the supplied partition"
+        );
+        assert!(
+            matches!(repo_context.remote_status().await, RemoteStatus::Offline),
+            "in-memory store has no remote, so the context must be Offline"
+        );
     }
 }

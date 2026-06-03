@@ -46,7 +46,7 @@ impl RemoteEndpoint {
     }
 
     /// Get (or open) the connection used for storage-session ops on `partition`.
-    async fn session_connection(
+    pub(crate) async fn session_connection(
         &self,
         partition: RepositoryId,
     ) -> Result<Arc<Connection>, ProtocolError> {
