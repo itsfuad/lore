@@ -2302,7 +2302,16 @@ impl State {
                     if child.is_dirty_add() {
                         result.push(child_path.clone());
                     }
-                    stack.push((child_id, child_path));
+                    // A dirty-delete directory is staged as the deletion of its
+                    // whole subtree: stage_delete on a directory recurses and
+                    // stages a delete for every descendant. Emit just this path
+                    // and don't descend — collecting descendants here would only
+                    // queue redundant deletes that stage_delete already covers.
+                    if child.is_dirty_delete() {
+                        result.push(child_path);
+                    } else {
+                        stack.push((child_id, child_path));
+                    }
                 }
             }
         }
@@ -5339,73 +5348,158 @@ async fn diff_filesystem_directory(
     Ok((changes, stats))
 }
 
-/// Whether any node in this subtree would be materialized on disk under the
-/// active filter, mirroring clone/checkout discovery: a file or link
-/// materializes when it is not excluded; a directory materializes when any
-/// descendant materializes, or — when it has no children — when the empty
-/// directory itself is not excluded.
+/// Emit a single `Delete` change for one node, reloading it so any dirty flags
+/// just persisted by [`State::node_mark_dirty`] are reflected in the record.
+async fn emit_single_delete(
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    node_id: NodeID,
+    path: &RelativePath,
+    sink: &mut ChangeSink<'_>,
+) -> Result<(), StateError> {
+    let block = state
+        .block(repository.clone(), NodeBlock::index(node_id))
+        .await?;
+    let node = block.node(Node::index(node_id));
+    let flags = compute_change_flags(&node, FileAction::Delete, false);
+    let from = NodeChangeState {
+        repository,
+        state,
+        node: node_id,
+        flags: NodeFlags::from_bits_retain(node.flags),
+        address: node.address,
+    };
+    let to = from.invalid();
+    sink.emit(NodeChange {
+        action: FileAction::Delete,
+        flags,
+        from,
+        to,
+        path: path.clone(),
+        from_path: None,
+    })
+    .await
+}
+
+/// Emit the buffered ancestor-directory deletes, outermost first, and clear the
+/// buffer so sibling subtrees don't re-emit them. When `scan_dirty` is set each
+/// directory is marked `DirtyDelete` first so a later bare `stage` (which walks
+/// dirty flags rather than rescanning) picks up the directory deletion.
+async fn flush_pending_dir_deletes(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    sink: &mut ChangeSink<'_>,
+    pending: &mut Vec<(NodeID, RelativePath)>,
+    scan_dirty: bool,
+) -> Result<(), StateError> {
+    for (node_id, path) in std::mem::take(pending) {
+        if scan_dirty {
+            state
+                .node_mark_dirty(repository.clone(), node_id, NodeFlags::DirtyDelete, true)
+                .await?;
+        }
+        emit_single_delete(state.clone(), repository.clone(), node_id, &path, sink).await?;
+    }
+    Ok(())
+}
+
+/// Walk a revision subtree that is absent from the filesystem and emit `Delete`
+/// changes for only the portion that was actually materialized on disk under the
+/// active filter, returning whether anything materialized.
 ///
-/// A view re-inclusion that contains a path separator (e.g.
-/// `!a/**/drop/**/keep/`) generates directory-traversal re-inclusion rules for
-/// every ancestor so the materializer can descend excluded directories to
-/// reach the re-included leaves. A side effect is that those ancestor
-/// directories evaluate as "not excluded" even when nothing inside them is in
-/// view. This walk tells a directory that only exists to be traversed (its
-/// whole subtree is filtered out, so it is never written to disk) apart from
-/// one that genuinely holds materialized content, so the filesystem diff does
-/// not report a phantom delete for a directory that was never materialized.
-async fn subtree_materializes(
+/// Materialization mirrors clone/checkout discovery: excluded children are
+/// pruned (never written), a non-excluded file or link materializes, and a
+/// directory materializes when a descendant does or — when it has no children —
+/// when the empty directory itself is not excluded.
+///
+/// A directory can evaluate as "not excluded" only because the filter let the
+/// diff descend through it (a view re-inclusion's generated traversal rules, or a
+/// glob matching the directory but not content deeper inside it) while nothing
+/// under it is in view. Such a directory is never written, so its delete record
+/// is buffered in `pending` and emitted only once a materializing descendant
+/// proves it existed on disk; if none does, the buffered entry is dropped. This
+/// keeps the report from claiming a delete for a directory that was never there.
+///
+/// When `scan_dirty` is set, every node a delete is emitted for — the
+/// materializing leaf and each flushed ancestor directory — is marked
+/// `DirtyDelete` so the persisted dirty-tracking state records the deletion at
+/// the granularity it is reported. `node_mark_dirty` short-circuits on a node
+/// already carrying the base `Dirty` bit (which `DirtyDelete` includes), so a
+/// sibling's upward propagation never clobbers a directory's `DirtyDelete`.
+#[allow(clippy::too_many_arguments)]
+async fn emit_filesystem_subtree_deletes(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     node_id: NodeID,
     node: &Node,
     path: &RelativePath,
     filter_mode: FilterMode,
+    scan_dirty: bool,
+    sink: &mut ChangeSink<'_>,
+    pending: &mut Vec<(NodeID, RelativePath)>,
 ) -> Result<bool, StateError> {
+    // Caller guarantees `node` is not filter-excluded.
     if node.is_file() || node.is_link() {
-        return Ok(!repository.filter.excludes(path, false, filter_mode));
+        flush_pending_dir_deletes(&state, &repository, sink, pending, scan_dirty).await?;
+        if scan_dirty {
+            state
+                .node_mark_dirty(repository.clone(), node_id, NodeFlags::DirtyDelete, true)
+                .await?;
+        }
+        emit_single_delete(state, repository, node_id, path, sink).await?;
+        return Ok(true);
     }
+
+    pending.push((node_id, path.clone()));
+    let depth = pending.len();
 
     let mut children =
         StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id).await?;
     let mut had_child = false;
+    let mut any_materialized = false;
     while let Some((child_id, child_node, child_name)) = children.next().await? {
         had_child = true;
         let child_path = path.push_into_buf(&child_name).freeze();
         // Release the block read lock before recursing (see NodeNameLock docs).
         drop(child_name);
-        let child_is_directory = child_node.is_directory();
-        // Prune at excluded children like clone/checkout do: an excluded child
-        // is never written, so it cannot make this directory materialize. This
-        // matches what was actually put on disk (a glob can exclude a directory
-        // while not matching a file deeper inside it) and skips excluded
-        // subtrees instead of walking them.
         if repository
             .filter
-            .excludes(&child_path, child_is_directory, filter_mode)
+            .excludes(&child_path, child_node.is_directory(), filter_mode)
         {
             continue;
         }
-        if !child_is_directory {
-            return Ok(true);
-        }
-        if Box::pin(subtree_materializes(
+        if Box::pin(emit_filesystem_subtree_deletes(
             state.clone(),
             repository.clone(),
             child_id,
             &child_node,
             &child_path,
             filter_mode,
+            scan_dirty,
+            sink,
+            pending,
         ))
         .await?
         {
-            return Ok(true);
+            any_materialized = true;
         }
     }
 
-    if !had_child {
-        return Ok(!repository.filter.excludes(path, true, filter_mode));
+    if any_materialized {
+        // The first materializing descendant already flushed this directory.
+        return Ok(true);
     }
+
+    if !had_child && !repository.filter.excludes(path, true, filter_mode) {
+        // Empty in-view directory: clone/checkout writes it, so its absence is a
+        // real deletion. It is the materializing leaf here, and its own buffered
+        // entry (pushed above) is flushed and marked along with its ancestors.
+        flush_pending_dir_deletes(&state, &repository, sink, pending, scan_dirty).await?;
+        return Ok(true);
+    }
+
+    // Nothing under this directory materialized: drop its buffered entry.
+    pending.truncate(depth - 1);
     Ok(false)
 }
 
@@ -5727,27 +5821,23 @@ async fn diff_filesystem_directory_walk(
             continue;
         };
 
-        // A directory that is only "not excluded" because a view re-inclusion
-        // generated traversal rules for it, yet whose entire subtree is
-        // filtered out, was never materialized on disk. Its absence is
-        // expected, not a deletion, so skip it instead of emitting a phantom
-        // delete (which would also recurse into nested excluded directories).
-        if from_node.node.is_directory()
-            && !subtree_materializes(
+        // Emit deletes only for the materialized portion of the subtree,
+        // suppressing directories the filter merely descended through but never
+        // wrote to disk (see emit_filesystem_subtree_deletes).
+        if from_node.node.is_directory() {
+            let mut pending = Vec::new();
+            emit_filesystem_subtree_deletes(
                 node_list.state.clone(),
                 node_list.repository.clone(),
                 from_named_node.node,
                 &from_node.node,
                 &from_node.path,
                 ctx.filter_mode,
+                ctx.scan_dirty,
+                &mut ChangeSink::Vec(&mut *changes),
+                &mut pending,
             )
-            .await?
-        {
-            lore_trace!(
-                "Skipping phantom delete for never-materialized directory {} at {}",
-                from_named_node.node,
-                from_node.path
-            );
+            .await?;
             continue;
         }
 

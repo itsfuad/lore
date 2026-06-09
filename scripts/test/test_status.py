@@ -408,6 +408,14 @@ def test_status_scan_view_filter(new_lore_repo, tmp_path_factory):
         f"untouched re-included directory should not be reported: {sorted(after_rmdir)}"
     )
 
+    # The scan above marked the deleted file and directory DirtyDelete, so a bare
+    # stage (no rescan) must pick the deletion up from the dirty flags; committing
+    # then records it and removes the directory from the new revision.
+    clone.stage()
+    clone.commit()
+    post = _status_entries(clone, scan=True)
+    assert post == {}, f"--scan after committing the deletion reported changes: {sorted(post)}"
+
 
 @pytest.mark.smoke
 def test_status_scan_view_pure_exclusion(new_lore_repo, tmp_path_factory):
