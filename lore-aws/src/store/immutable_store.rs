@@ -330,6 +330,11 @@ static STORE_ATTRIBUTES: LazyLock<[KeyValue; 1]> =
 
 type BatchTaskResult = Result<(usize, StoreMatch), (usize, StoreError)>;
 
+struct GetS3objectContentsOutput {
+    read: usize,
+    bytes: BytesMut,
+}
+
 pub struct AwsImmutableStore {
     s3: S3,
     dynamodb: DynamoDb,
@@ -993,6 +998,30 @@ impl AwsImmutableStore {
         Ok(())
     }
 
+    /// Loads fragment metadata, with just size validation
+    async fn metadata_with_size_validation(&self, hash: Hash) -> Result<Fragment, StoreError> {
+        let metadata = self.load_metadata(hash).await?;
+        // Reject upfront before issuing the S3 GET: a corrupt metadata entry
+        // could declare a payload larger than the protocol threshold, which
+        // would then be happily extended into the in-memory buffer below.
+        lore_storage::validate_fragment_size(&metadata)?;
+        Ok(metadata)
+    }
+
+    /// Loads fragment metadata, applying all validation
+    /// to ensure it is a valid fragment to load
+    async fn metadata_with_load_validation(&self, hash: Hash) -> Result<Fragment, StoreError> {
+        let metadata = self.metadata_with_size_validation(hash).await?;
+
+        if (metadata.flags & FragmentFlags::PayloadObliteration) != 0 {
+            return Err(StoreError::from(AddressNotFound::from(
+                Address::zero_context_hash(hash),
+            )));
+        };
+
+        Ok(metadata)
+    }
+
     async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
         let item = serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).map_err(|e| {
             warn!("Failed to serialize fragment metadata entry for {hash}: {e:?}");
@@ -1039,14 +1068,11 @@ impl AwsImmutableStore {
         })
     }
 
-    async fn read_payload(&self, hash: Hash, fragment: Fragment) -> Result<Bytes, StoreError> {
-        // Reject upfront before issuing the S3 GET: a corrupt metadata entry
-        // could declare a payload larger than the protocol threshold, which
-        // would then be happily extended into the in-memory buffer below.
-        lore_storage::validate_fragment_size(&fragment)?;
-
+    async fn get_s3_object_contents(
+        &self,
+        hash: Hash,
+    ) -> Result<GetS3objectContentsOutput, StoreError> {
         let mut dst = [0u8; 64];
-
         let mut output = self
             .s3
             .get_object(
@@ -1057,7 +1083,7 @@ impl AwsImmutableStore {
             .await
             .map_err(|e| {
                 if let AwsError::AwsSdkError(sdk_error) = e {
-                    debug!(hash = %hash, error = ?sdk_error, "read_payload SDK error getting object");
+                    debug!(hash = %hash, error = ?sdk_error, "get_s3_payload SDK error getting object");
                     match sdk_error.into_service_error() {
                         GetObjectError::NoSuchKey(_) => StoreError::from(AddressNotFound::from(
                             Address::zero_context_hash(hash),
@@ -1065,7 +1091,7 @@ impl AwsImmutableStore {
                         _ => StoreError::from(SlowDown),
                     }
                 } else {
-                    warn!(hash = %hash, error = ?e, "read_payload failed to get object");
+                    debug!(hash = %hash, error = ?e, "get_s3_payload failed to get object");
                     StoreError::internal_with_context(e, "S3 get object failed")
                 }
             })?;
@@ -1084,8 +1110,20 @@ impl AwsImmutableStore {
         }
         trace!("Total read {read} bytes from S3 stream");
 
+        Ok(GetS3objectContentsOutput {
+            bytes: buffer,
+            read,
+        })
+    }
+
+    fn read_payload(
+        &self,
+        mut s3_contents: GetS3objectContentsOutput,
+        hash: Hash,
+        fragment: Fragment,
+    ) -> Result<Bytes, StoreError> {
         let payload_size = fragment.size_payload as usize;
-        let buffer_size = buffer.len();
+        let buffer_size = s3_contents.bytes.len();
 
         // This exists to work around an inconsistency that can occur as we switch from storing
         // metadata prefixed to objects in S3 to storing metadata separately in Dynamo. If the
@@ -1096,16 +1134,17 @@ impl AwsImmutableStore {
             && (buffer_size - payload_size) == size_of::<Fragment>()
             && self.force_write
         {
-            buffer.split_off(size_of::<Fragment>()).freeze()
+            s3_contents.bytes.split_off(size_of::<Fragment>()).freeze()
         } else {
-            buffer.freeze()
+            s3_contents.bytes.freeze()
         };
 
         if buffer_size == payload_size {
             Ok(buffer)
         } else {
             warn!(
-                "Wrong number of bytes read from payload, expected {payload_size} but got {buffer_size}, from a total of {read} bytes read"
+                "Wrong number of bytes read from payload, expected {payload_size} but got {buffer_size}, from a total of {} bytes read",
+                s3_contents.read
             );
             Err(StoreError::internal(format!(
                 "Failed to load from immutable store, size mismatch (load {buffer_size}, expected {payload_size}) for get {hash}"
@@ -1114,17 +1153,32 @@ impl AwsImmutableStore {
     }
 
     async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
-        let fragment = self.load_metadata(hash).await?;
+        // Run both futures concurrently. The select! loop breaks as soon as metadata resolves.
+        // If S3 finishes first its result is stashed, and we keep waiting for metadata.
+        let metadata_fut = self.metadata_with_load_validation(hash);
+        let s3_fut = self.get_s3_object_contents(hash);
+        tokio::pin!(metadata_fut, s3_fut);
+        let mut s3_result = None;
+        let metadata_result = loop {
+            tokio::select! {
+                result = &mut metadata_fut => break result,
+                result = &mut s3_fut, if s3_result.is_none() => {
+                    s3_result = Some(result);
+                }
+            }
+        };
 
-        if (fragment.flags & FragmentFlags::PayloadObliteration) != 0 {
-            Err(StoreError::from(AddressNotFound::from(
-                Address::zero_context_hash(hash),
-            )))
-        } else {
-            let payload = self.read_payload(hash, fragment).await?;
+        // If metadata failed, its error is returned here; s3_fut is dropped (canceled) on the
+        // early return. Metadata error takes priority over any S3 error.
+        let fragment = metadata_result?;
 
-            Ok((fragment, payload))
-        }
+        let s3_contents = match s3_result {
+            Some(r) => r?,
+            None => s3_fut.await?,
+        };
+
+        let payload = self.read_payload(s3_contents, hash, fragment)?;
+        Ok((fragment, payload))
     }
 }
 
@@ -1210,6 +1264,9 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     return Err(StoreError::from(AddressNotFound::from(address)));
                 }
 
+                // `get` is boxed anyway via async_trait, so future state machine
+                // is already heap allocated
+                #[allow(clippy::large_futures)]
                 self.load(address.hash).await
             })
             .into();
@@ -1322,7 +1379,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             let span = tracing::Span::current();
 
             let original_metadata = self
-                .load_metadata(address.hash)
+                .metadata_with_size_validation(address.hash)
                 .instrument(span.clone())
                 .await?;
 
@@ -1350,9 +1407,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 // only cares about the size fields (which haven't changed), but it feels wrong given it
                 // doesn't explicitly match the metadata for what's currently in S3.
                 let payload = self
-                    .read_payload(address.hash, original_metadata)
-                    .instrument(span.clone())
-                    .await?
+                    .read_payload(self.get_s3_object_contents(address.hash).await?, address.hash, original_metadata)?
                     .to_aligned::<FragmentReference>();
 
                 let sub_fragments = payload.as_type_slice::<FragmentReference>();
@@ -2543,15 +2598,15 @@ mod test {
 
     #[tokio::test]
     async fn test_get_immutable_obliterated() {
+        let (_, address, payload) = fragment::generate_random();
         let repository = random::<Context>();
-        let address = random::<Address>();
         let fragment = Fragment {
             flags: FragmentFlags::PayloadObliterating.bits(),
             size_payload: 0,
             size_content: 0,
         };
 
-        let s3mock = MockS3Impl::default();
+        let mut s3mock = MockS3Impl::default();
         let mut dynamodb_mock = MockDynamoDb::default();
 
         let entry = FragmentsEntry::new(repository, address);
@@ -2563,6 +2618,20 @@ mod test {
             StoreMatch::MatchHash,
             StoreMatch::MatchHash,
         );
+
+        // the store will opportunistically try to get the data
+        // from s3, but because the metadata shows it is obliterated
+        // it will not load, even if s3 says it is there
+        {
+            let mut s3payload = vec![];
+            s3payload.extend_from_slice(payload.as_ref());
+
+            s3mock.expect_get_object().return_once(|_, _, _| {
+                Ok(GetObjectOutput::builder()
+                    .set_body(Some(s3payload.into()))
+                    .build())
+            });
+        }
 
         let metadata_entry = FragmentMetadataEntry::new(address.hash);
         let av_map: HashMap<String, AttributeValue> =
